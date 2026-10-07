@@ -9,7 +9,7 @@ var SITE = {
   AJAX: '/wp/wp-admin/admin-ajax.php',
   NAME: 'filmabisi4',
   // true iken akış bulunamazsa nedenini "DEBUG" satırları olarak gösterir. Çalışınca false yap.
-  DEBUG: true
+  DEBUG: false
 };
 
 var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
