@@ -184,6 +184,43 @@ function uniq(arr) {
   return out;
 }
 
+// Sayfadaki dizipod.com iç linklerinin yolları
+function pathsFromHtml(html) {
+  var re = /href=["']([^"'#]+)["']/gi, m, out = [];
+  while ((m = re.exec(String(html || ''))) !== null) {
+    var u = absUrl(m[1]);
+    if (u.indexOf(SITE.DOMAIN) !== 0) continue;
+    var p = u.substr(SITE.DOMAIN.length).split('?')[0];
+    if (p.length < 4 || /^\/wp-|\.(css|js|png|jpe?g|webp|svg|ico|xml)$/i.test(p)) continue;
+    if (out.indexOf(p) === -1) out.push(p);
+  }
+  return out;
+}
+
+// Arama: önce WordPress REST araması, sonra normal /?s= sayfası
+function searchPaths(query, tag) {
+  var q = encodeURIComponent(query);
+  var h = pageHeaders();
+  h['Accept'] = 'application/json';
+  return Promise.all([
+    getText(SITE.DOMAIN + '/wp-json/wp/v2/search?per_page=10&search=' + q, h, 'WJ' + tag),
+    getText(SITE.DOMAIN + '/?s=' + q, null, 'S' + tag)
+  ]).then(function (r) {
+    var out = [];
+    try {
+      var arr = JSON.parse(r[0] || '[]');
+      (arr || []).forEach(function (x) {
+        var u = absUrl(x && x.url);
+        if (u.indexOf(SITE.DOMAIN) === 0) out.push(u.substr(SITE.DOMAIN.length));
+      });
+    } catch (e) {}
+    dbg.push('wpjson ' + out.length);
+    var fromHtml = pathsFromHtml(r[1]);
+    fromHtml.forEach(function (p) { if (out.indexOf(p) === -1) out.push(p); });
+    return out;
+  });
+}
+
 function findMoviePage(title, origTitle, year) {
   var slugs = uniq([slugify(origTitle), slugify(title)]);
   var paths = [];
@@ -192,24 +229,58 @@ function findMoviePage(title, origTitle, year) {
 
   return pickFirst(paths, function (h) { return isRightMovie(h, title, origTitle, year); }).then(function (found) {
     if (found) return found;
-    // Yedek: site içi arama sayfası
-    return getText(SITE.DOMAIN + '/?s=' + encodeURIComponent(origTitle || title), null, 'S1').then(function (html) {
-      var re = /href="(?:https?:\/\/dizipod\.com)?(\/film\/[a-z0-9-]+\/)"/g, m, extra = [];
-      while ((m = re.exec(html)) !== null) {
-        if (paths.indexOf(m[1]) === -1 && extra.indexOf(m[1]) === -1) extra.push(m[1]);
+    var queries = uniq([origTitle, title]).filter(function (q) { return norm(q).length >= 2; });
+    return Promise.all(queries.map(function (q, i) { return searchPaths(q, i + 1); })).then(function (lists) {
+      var all = [];
+      lists.forEach(function (l) { l.forEach(function (p) { if (all.indexOf(p) === -1) all.push(p); }); });
+      var cand = all.filter(function (p) { return /^\/film\//.test(p) && paths.indexOf(p) === -1; }).slice(0, 6);
+      dbg.push('aday ' + cand.length + ' / link ' + all.length);
+      if (!cand.length) {
+        dbg.push('ornek ' + all.slice(0, 4).join(' '));
+        return null;
       }
-      extra = extra.slice(0, 5);
-      dbg.push('arama link ' + extra.length);
-      if (!extra.length) return null;
-      return pickFirst(extra, function (h) { return isRightMovie(h, title, origTitle, year); });
+      return pickFirst(cand, function (h) { return isRightMovie(h, title, origTitle, year); });
     });
   });
 }
 
-function findEpisodePage(name, origName, season, episode) {
-  var slugs = uniq([slugify(origName), slugify(name)]);
+function findEpisodePage(names, season, episode) {
+  names = names.filter(function (n) { return slugify(n); });
+  var slugs = uniq(names.map(slugify));
   var paths = slugs.map(function (s) { return '/' + s + '-' + season + '-sezon-' + episode + '-bolum/'; });
-  return pickFirst(paths, hasPlayer);
+  dbg.push('slug ' + slugs.join(','));
+
+  return pickFirst(paths, hasPlayer).then(function (found) {
+    if (found || !slugs.length) return found;
+    var epRe = new RegExp('(?:-|/)' + season + '-sezon-' + episode + '-bolum/?$|sezon-' + season + '/bolum-' + episode + '/?$');
+    var queries = uniq(names).slice(0, 3);
+    return Promise.all(queries.map(function (q, i) { return searchPaths(q, i + 1); })).then(function (lists) {
+      var all = [];
+      lists.forEach(function (l) { l.forEach(function (p) { if (all.indexOf(p) === -1) all.push(p); }); });
+      var direct = all.filter(function (p) { return epRe.test(p) && paths.indexOf(p) === -1; });
+      var series = all.filter(function (p) {
+        return !epRe.test(p) && slugs.some(function (s) { return p.indexOf(s) > -1; });
+      }).slice(0, 3);
+      dbg.push('direkt ' + direct.length + ' dizi ' + series.length + ' / link ' + all.length);
+      if (!direct.length && !series.length) dbg.push('ornek ' + all.slice(0, 4).join(' '));
+      if (direct.length) return pickFirst(direct.slice(0, 4), hasPlayer);
+      if (!series.length) return null;
+      return Promise.all(series.map(function (p, i) {
+        return getText(SITE.DOMAIN + p, null, 'D' + (i + 1));
+      })).then(function (pages) {
+        var eps = [];
+        pages.forEach(function (h) {
+          pathsFromHtml(h).forEach(function (p) { if (epRe.test(p) && eps.indexOf(p) === -1) eps.push(p); });
+        });
+        dbg.push('bolum linki ' + eps.length);
+        if (!eps.length) {
+          dbg.push('dizi ornek ' + series[0]);
+          return null;
+        }
+        return pickFirst(eps.slice(0, 4), hasPlayer);
+      });
+    });
+  });
 }
 
 // ---------------- Oynatıcı çözme ----------------
@@ -319,31 +390,42 @@ function debugStream(msg) {
 //  NUVIO GİRİŞ NOKTASI
 // ============================================================
 
+function getJson(url) {
+  return withTimeout(fetch(url), 10000).then(function (res) { return res.json(); });
+}
+
 function getStreams(tmdbId, mediaType, season, episode) {
   dbg = [];
   var isTv = mediaType === 'tv';
   if (!isTv && mediaType !== 'movie') return Promise.resolve([]);
 
-  var url = 'https://api.themoviedb.org/3/' + (isTv ? 'tv/' : 'movie/') + tmdbId +
-            '?language=tr-TR&api_key=' + TMDB_KEY;
+  var base = 'https://api.themoviedb.org/3/' + (isTv ? 'tv/' : 'movie/') + tmdbId + '?api_key=' + TMDB_KEY;
 
-  return withTimeout(fetch(url), 10000)
-    .then(function (res) { return res.json(); })
-    .then(function (info) {
+  return Promise.all([
+    getJson(base + '&language=tr-TR'),
+    getJson(base + '&language=en-US').catch(function () { return {}; })
+  ]).then(function (both) {
+      var info = both[0], en = both[1] || {};
       if (isTv) {
         var name = info.name, orig = info.original_name;
         if (!name) return debugStream('TMDB bilgisi eksik');
         var s = parseInt(season, 10) || 1, e = parseInt(episode, 10) || 1;
-        return findEpisodePage(name, orig, s, e).then(function (found) {
-          if (!found) return debugStream('bolum sayfasi yok: ' + name + ' ' + s + 'x' + e);
+        // Kore/Japon dizilerinde orijinal ad ASCII değil; İngilizce ad ve TR ad yedek olarak denenir
+        var names = uniq([orig, en.name, name]);
+        return findEpisodePage(names, s, e).then(function (found) {
+          if (!found) return debugStream('bolum sayfasi yok: ' + (en.name || name) + ' ' + s + 'x' + e);
           log('sayfa: ' + found.url);
-          return streamsFromPage(found, name + ' S' + s + 'E' + e);
+          return streamsFromPage(found, (en.name || name) + ' S' + s + 'E' + e);
         });
       }
       var title = info.title, origTitle = info.original_title;
       var year = (info.release_date || '').slice(0, 4);
       if (!title || !year) return debugStream('TMDB bilgisi eksik');
-      return findMoviePage(title, origTitle, year).then(function (found) {
+      var origs = uniq([origTitle, en.title]);
+      return findMoviePage(title, origs[0], year).then(function (found) {
+        if (!found && origs[1] && slugify(origs[1]) !== slugify(origs[0])) return findMoviePage(title, origs[1], year);
+        return found;
+      }).then(function (found) {
         if (!found) return debugStream('sayfa yok: ' + title + ' ' + year);
         log('sayfa: ' + found.url);
         return streamsFromPage(found, SITE.NAME);
